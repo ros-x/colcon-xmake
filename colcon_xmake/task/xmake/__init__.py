@@ -1,0 +1,1 @@
+XMAKE_EXECUTABLE = 'xmake'
