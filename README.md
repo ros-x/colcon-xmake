@@ -45,3 +45,4 @@ colcon test --packages-select demo_xmake_cpp
 - `docs/USAGE.md`
 - `docs/TESTING.md`
 - `docs/RELEASE.md`
+- `CHANGELOG.md`
