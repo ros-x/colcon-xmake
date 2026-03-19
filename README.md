@@ -39,3 +39,9 @@ colcon test --packages-select demo_xmake_cpp
 
 - `--builddir` / install layout are managed by the plugin; do not pass these via `--xmake-config-args`.
 - `xmake` test results are exported to JUnit XML under `--test-result-base` when available.
+
+## Docs
+
+- `docs/USAGE.md`
+- `docs/TESTING.md`
+- `docs/RELEASE.md`
