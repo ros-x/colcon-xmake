@@ -1,6 +1,31 @@
 # colcon-xmake
 
-`colcon` extension package that adds xmake build/test support, including ROS package type `ros.ament_xmake`.
+[![CI](https://github.com/ros-x/colcon-xmake/actions/workflows/ci.yml/badge.svg)](https://github.com/ros-x/colcon-xmake/actions/workflows/ci.yml)
+
+A [colcon](https://colcon.readthedocs.io/) plugin that adds [xmake](https://xmake.io/) build and test support for ROS 2 packages.
+It provides the `xmake` and `ros.ament_xmake` build types so that ROS 2 workspaces can include packages built with xmake alongside traditional CMake/ament packages.
+
+## Requirements
+
+- Python 3.10+
+- colcon-core >= 0.16.0
+- xmake
+
+## Installation
+
+Install from PyPI:
+
+```bash
+pip install colcon-xmake
+```
+
+Or install from source for development:
+
+```bash
+git clone https://github.com/ros-x/colcon-xmake.git
+cd colcon-xmake
+python3 -m pip install -e .
+```
 
 ## Entry points
 
@@ -12,12 +37,6 @@
   - `ros.ament_xmake`
 - `colcon_core.package_identification`
   - `xmake` (optional generic identification via `xmake.lua`)
-
-## Install
-
-```bash
-python3 -m pip install --break-system-packages -e .
-```
 
 ## Common usage
 
@@ -46,3 +65,11 @@ colcon test --packages-select demo_xmake_cpp
 - `docs/TESTING.md`
 - `docs/RELEASE.md`
 - `CHANGELOG.md`
+
+## Related projects
+
+See the [ros-x](https://github.com/ros-x) organization for related projects.
+
+## License
+
+Apache License 2.0 -- see [LICENSE](LICENSE) for details.
