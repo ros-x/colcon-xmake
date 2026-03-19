@@ -1,5 +1,8 @@
+import shutil
+
 from colcon_core.logging import colcon_logger
 from colcon_core.plugin_system import satisfies_version
+from colcon_core.shell import get_command_environment
 from colcon_core.task import TaskExtensionPoint
 
 from colcon_xmake.task.xmake import XMAKE_EXECUTABLE
@@ -23,5 +26,18 @@ class XmakeTestTask(TaskExtensionPoint):
     async def test(self):
         args = self.context.args
         logger.info(f"Testing xmake package in '{args.path}'")
+
+        if not shutil.which(XMAKE_EXECUTABLE):
+            logger.error("Could not find 'xmake' executable in PATH")
+            return 1
+
+        try:
+            env = await get_command_environment(
+                'test', args.build_base, self.context.dependencies)
+        except RuntimeError as e:
+            logger.error(str(e))
+            return 1
+
         cmd = [XMAKE_EXECUTABLE, 'test'] + (args.xmake_test_args or [])
-        return run_command(cmd, cwd=args.path)
+        return await run_command(
+            self.context, cmd, cwd=str(args.path), env=env)

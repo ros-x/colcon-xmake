@@ -1,5 +1,6 @@
 from pathlib import Path
-import subprocess
+
+from colcon_core.task import run
 
 
 def ensure_build_layout(args):
@@ -7,6 +8,6 @@ def ensure_build_layout(args):
     Path(args.install_base).mkdir(parents=True, exist_ok=True)
 
 
-def run_command(cmd, *, cwd=None, env=None):
-    result = subprocess.run(cmd, cwd=cwd, env=env, check=False)
-    return result.returncode
+async def run_command(context, cmd, *, cwd=None, env=None):
+    completed = await run(context, cmd, cwd=cwd, env=env)
+    return completed.returncode

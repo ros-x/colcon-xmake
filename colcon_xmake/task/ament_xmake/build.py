@@ -3,6 +3,8 @@ from pathlib import Path
 from colcon_core.environment import create_environment_scripts
 from colcon_core.logging import colcon_logger
 from colcon_core.plugin_system import satisfies_version
+from colcon_core.task import create_file
+from colcon_core.task import install
 from colcon_core.task import TaskExtensionPoint
 
 from colcon_xmake.task.xmake.build import XmakeBuildTask
@@ -40,14 +42,27 @@ class AmentXmakeBuildTask(TaskExtensionPoint):
             return rc
 
         install_base = Path(args.install_base)
-        marker = install_base / 'share' / 'ament_index' / 'resource_index' / 'packages' / self.context.pkg.name
+        marker = (
+            install_base / 'share' / 'ament_index' / 'resource_index' /
+            'packages' / self.context.pkg.name
+        )
         manifest = install_base / 'share' / self.context.pkg.name / 'package.xml'
         if not marker.exists():
-            logger.error(f"Missing ament index marker after build: {marker}")
-            return 1
+            logger.warning(
+                f"Package '{self.context.pkg.name}' doesn't install an ament "
+                'resource index marker explicitly; creating fallback marker')
+            create_file(
+                args,
+                'share/ament_index/resource_index/packages/'
+                f'{self.context.pkg.name}'
+            )
         if not manifest.exists():
-            logger.error(f"Missing installed package manifest after build: {manifest}")
-            return 1
+            logger.warning(
+                f"Package '{self.context.pkg.name}' doesn't install "
+                "'package.xml' explicitly; installing fallback copy")
+            install(
+                args, 'package.xml',
+                f'share/{self.context.pkg.name}/package.xml')
 
         create_environment_scripts(self.context.pkg, args)
         return 0
