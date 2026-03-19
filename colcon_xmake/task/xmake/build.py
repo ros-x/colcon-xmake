@@ -77,6 +77,7 @@ class XmakeBuildTask(TaskExtensionPoint):
             return 1
         if getattr(args, 'symlink_install', False):
             env['AMENT_XMAKE_SYMLINK_INSTALL'] = '1'
+        env['AMENT_XMAKE_SOURCE_DIR'] = str(args.path)
         rule_file = resolve_ament_xmake_rule_file(env.get('AMENT_PREFIX_PATH'))
         if rule_file:
             env['AMENT_XMAKE_RULE_FILE'] = rule_file
