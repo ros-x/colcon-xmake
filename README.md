@@ -9,7 +9,7 @@ It provides the `xmake` and `ros.ament_xmake` build types so that ROS 2 workspac
 
 - Python 3.10+
 - colcon-core >= 0.16.0
-- xmake
+- [xmake](https://xmake.io/) (install via [xlings](https://github.com/d2learn/xlings): `xlings install xmake`)
 
 ## Installation
 
