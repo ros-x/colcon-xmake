@@ -1,6 +1,7 @@
 from pathlib import Path
 import asyncio
 import argparse
+import sys
 
 from colcon_core.task import run
 
@@ -24,7 +25,19 @@ def normalize_timeout(value):
     return timeout
 
 
+def _patch_isatty():
+    """Patch sys.stdout/stderr with isatty() if missing.
+
+    colcon's console_direct event handler wraps stdout/stderr in ProxyFile
+    objects that lack isatty(), causing colcon_core.subprocess.run to crash.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if not hasattr(stream, 'isatty'):
+            stream.isatty = lambda: False
+
+
 async def run_command(context, cmd, *, cwd=None, env=None, timeout=None):
+    _patch_isatty()
     try:
         completed = await asyncio.wait_for(
             run(context, cmd, cwd=cwd, env=env), timeout=timeout)
