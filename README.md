@@ -12,3 +12,30 @@
   - `ros.ament_xmake`
 - `colcon_core.package_identification`
   - `xmake` (optional generic identification via `xmake.lua`)
+
+## Install
+
+```bash
+python3 -m pip install --break-system-packages -e .
+```
+
+## Common usage
+
+```bash
+colcon build --packages-up-to demo_xmake_cpp
+colcon test --packages-select demo_xmake_cpp
+```
+
+## xmake-specific arguments
+
+- `--xmake-config-args`
+- `--xmake-build-args`
+- `--xmake-install-args`
+- `--xmake-test-args`
+- `--xmake-timeout <seconds>`
+- `--xmake-skip-install` (not valid for `ros.ament_xmake`)
+
+## Notes
+
+- `--builddir` / install layout are managed by the plugin; do not pass these via `--xmake-config-args`.
+- `xmake` test results are exported to JUnit XML under `--test-result-base` when available.

@@ -29,6 +29,13 @@ class AmentXmakeBuildTask(TaskExtensionPoint):
         logger.info(
             f"Building ROS package in '{args.path}' with build type 'ament_xmake'")
 
+        if getattr(args, 'xmake_skip_install', False):
+            logger.error(
+                '--xmake-skip-install is not supported for ros.ament_xmake '
+                'packages because install artifacts are required for ROS env '
+                'setup and package discovery')
+            return 2
+
         if args.ament_xmake_args:
             if args.xmake_config_args is None:
                 args.xmake_config_args = []

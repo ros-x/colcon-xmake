@@ -14,6 +14,8 @@ def test_xmake_build_arguments_registration():
     assert hasattr(args, 'xmake_config_args')
     assert hasattr(args, 'xmake_build_args')
     assert hasattr(args, 'xmake_install_args')
+    assert hasattr(args, 'xmake_timeout')
+    assert hasattr(args, 'xmake_skip_install')
 
 
 def test_xmake_test_arguments_registration():
@@ -22,6 +24,7 @@ def test_xmake_test_arguments_registration():
     ext.add_arguments(parser=parser)
     args = parser.parse_args([])
     assert hasattr(args, 'xmake_test_args')
+    assert hasattr(args, 'xmake_timeout')
 
 
 def test_ament_xmake_build_arguments_registration():

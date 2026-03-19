@@ -6,6 +6,7 @@ from colcon_core.shell import get_command_environment
 from colcon_core.task import TaskExtensionPoint
 
 from colcon_xmake.task import ensure_build_layout
+from colcon_xmake.task import normalize_timeout
 from colcon_xmake.task import run_command
 from colcon_xmake.task.xmake import XMAKE_EXECUTABLE
 
@@ -29,10 +30,24 @@ class XmakeBuildTask(TaskExtensionPoint):
         parser.add_argument(
             '--xmake-install-args', nargs='*', metavar='*', type=str.lstrip,
             help='Pass arguments to xmake install step')
+        parser.add_argument(
+            '--xmake-timeout', type=normalize_timeout,
+            help='Timeout in seconds for each xmake command')
+        parser.add_argument(
+            '--xmake-skip-install', action='store_true',
+            help='Skip xmake install step')
 
     async def build(self):
         args = self.context.args
         logger.info(f"Building xmake package in '{args.path}'")
+
+        disallowed = ('--builddir', '-o', '--installdir')
+        for value in args.xmake_config_args or []:
+            if value.startswith(disallowed):
+                logger.error(
+                    "Do not pass build/install directory flags via "
+                    "--xmake-config-args; they are managed by colcon")
+                return 2
 
         if not shutil.which(XMAKE_EXECUTABLE):
             logger.error("Could not find 'xmake' executable in PATH")
@@ -44,6 +59,8 @@ class XmakeBuildTask(TaskExtensionPoint):
         except RuntimeError as e:
             logger.error(str(e))
             return 1
+        if getattr(args, 'symlink_install', False):
+            env['AMENT_XMAKE_SYMLINK_INSTALL'] = '1'
 
         ensure_build_layout(args)
 
@@ -53,15 +70,24 @@ class XmakeBuildTask(TaskExtensionPoint):
             '--builddir=' + args.build_base,
         ] + (args.xmake_config_args or [])
         rc = await run_command(
-            self.context, config_cmd, cwd=str(args.path), env=env)
+            self.context, config_cmd, cwd=str(args.path), env=env,
+            timeout=args.xmake_timeout)
         if rc:
+            if rc == 124:
+                logger.error("xmake configure step timed out")
             return rc
 
         build_cmd = [XMAKE_EXECUTABLE, 'build'] + (args.xmake_build_args or [])
         rc = await run_command(
-            self.context, build_cmd, cwd=str(args.path), env=env)
+            self.context, build_cmd, cwd=str(args.path), env=env,
+            timeout=args.xmake_timeout)
         if rc:
+            if rc == 124:
+                logger.error("xmake build step timed out")
             return rc
+
+        if args.xmake_skip_install:
+            return 0
 
         install_cmd = [
             XMAKE_EXECUTABLE, 'install',
@@ -69,4 +95,5 @@ class XmakeBuildTask(TaskExtensionPoint):
             '-o', args.install_base,
         ] + (args.xmake_install_args or [])
         return await run_command(
-            self.context, install_cmd, cwd=str(args.path), env=env)
+            self.context, install_cmd, cwd=str(args.path), env=env,
+            timeout=args.xmake_timeout)
