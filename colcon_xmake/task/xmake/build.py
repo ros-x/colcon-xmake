@@ -1,4 +1,5 @@
 import shutil
+from pathlib import Path
 
 from colcon_core.logging import colcon_logger
 from colcon_core.plugin_system import satisfies_version
@@ -12,6 +13,20 @@ from colcon_xmake.task.xmake import XMAKE_EXECUTABLE
 from colcon_xmake.task.xmake import resolve_ament_xmake_rule_file
 
 logger = colcon_logger.getChild(__name__)
+
+
+def _lua_quote(text):
+    return text.replace('\\', '\\\\').replace('"', '\\"')
+
+
+def _write_entry_file(build_base, project_path, rule_file):
+    path = Path(build_base) / 'colcon_xmake_entry.lua'
+    lines = []
+    if rule_file:
+        lines.append(f'includes("{_lua_quote(rule_file)}")')
+    lines.append(f'includes("{_lua_quote(str(Path(project_path) / "xmake.lua"))}")')
+    path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    return str(path)
 
 
 class XmakeBuildTask(TaskExtensionPoint):
@@ -65,6 +80,14 @@ class XmakeBuildTask(TaskExtensionPoint):
         rule_file = resolve_ament_xmake_rule_file(env.get('AMENT_PREFIX_PATH'))
         if rule_file:
             env['AMENT_XMAKE_RULE_FILE'] = rule_file
+        pkg_type = getattr(self.context.pkg, 'type', None)
+        if pkg_type == 'ros.ament_xmake' and not rule_file:
+            logger.error(
+                "Could not resolve ament_xmake rule file from AMENT_PREFIX_PATH. "
+                "Build/install 'ament_xmake' first and source the workspace setup.")
+            return 1
+        entry_file = _write_entry_file(
+            args.build_base, str(args.path), rule_file)
 
         ensure_build_layout(args)
 
@@ -72,6 +95,7 @@ class XmakeBuildTask(TaskExtensionPoint):
             XMAKE_EXECUTABLE, 'f',
             '--yes',
             '--builddir=' + args.build_base,
+            '--file=' + entry_file,
         ] + (args.xmake_config_args or [])
         rc = await run_command(
             self.context, config_cmd, cwd=str(args.path), env=env,
@@ -81,7 +105,10 @@ class XmakeBuildTask(TaskExtensionPoint):
                 logger.error("xmake configure step timed out")
             return rc
 
-        build_cmd = [XMAKE_EXECUTABLE, 'build'] + (args.xmake_build_args or [])
+        build_cmd = [
+            XMAKE_EXECUTABLE, 'build',
+            '--file=' + entry_file,
+        ] + (args.xmake_build_args or [])
         rc = await run_command(
             self.context, build_cmd, cwd=str(args.path), env=env,
             timeout=args.xmake_timeout)
@@ -97,6 +124,7 @@ class XmakeBuildTask(TaskExtensionPoint):
             XMAKE_EXECUTABLE, 'install',
             '--yes',
             '-o', args.install_base,
+            '--file=' + entry_file,
         ] + (args.xmake_install_args or [])
         return await run_command(
             self.context, install_cmd, cwd=str(args.path), env=env,
