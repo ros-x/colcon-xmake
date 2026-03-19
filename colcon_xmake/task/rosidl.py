@@ -1,0 +1,737 @@
+"""rosidl code generation pipeline for xmake packages.
+
+Orchestrates the rosidl adapter, generators, and typesupport backends
+to produce C/C++ code from .msg/.srv/.action interface definitions.
+"""
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+from colcon_core.logging import colcon_logger
+
+logger = colcon_logger.getChild(__name__)
+
+
+def find_interface_files(source_dir):
+    """Scan source directory for .msg, .srv, .action files."""
+    source = Path(source_dir)
+    result = {'msg': [], 'srv': [], 'action': []}
+    for kind in result:
+        subdir = source / kind
+        if subdir.is_dir():
+            for f in sorted(subdir.iterdir()):
+                if f.suffix == f'.{kind}':
+                    result[kind].append(f)
+    return result
+
+
+def has_interfaces(source_dir):
+    """Check if this package has any interface files."""
+    files = find_interface_files(source_dir)
+    return any(files.values())
+
+
+def _run_adapter(source_dir, pkg_name, output_dir):
+    """Convert .msg/.srv/.action to .idl using rosidl_adapter."""
+    source = Path(source_dir)
+    output = Path(output_dir) / 'rosidl_adapter' / pkg_name
+    output.mkdir(parents=True, exist_ok=True)
+
+    interface_files = find_interface_files(source_dir)
+    idl_tuples = []
+
+    from rosidl_adapter import convert_to_idl
+
+    for kind, files in interface_files.items():
+        if not files:
+            continue
+        for f in files:
+            try:
+                # interface_file must be relative to package_dir
+                rel_path = f.relative_to(source)
+                idl_path = convert_to_idl(
+                    source,        # package_dir
+                    pkg_name,      # package_name
+                    rel_path,      # interface_file (relative Path)
+                    output,        # output_dir
+                )
+                idl_tuples.append(f'{pkg_name}:{kind}/{Path(idl_path).name}')
+            except Exception as e:
+                logger.error(f'Failed to convert {f}: {e}')
+                raise
+
+    return idl_tuples, str(output)
+
+
+def _resolve_dependencies(pkg_name, ament_prefix_path):
+    """Resolve interface dependencies from installed packages."""
+    deps = {}
+    if not ament_prefix_path:
+        return deps
+
+    for prefix in ament_prefix_path.split(':'):
+        if not prefix:
+            continue
+        prefix = Path(prefix)
+        # Check rosidl_interfaces index
+        index_file = (
+            prefix / 'share' / 'ament_index' / 'resource_index' /
+            'rosidl_interfaces'
+        )
+        if not index_file.is_dir():
+            continue
+        for pkg_index in index_file.iterdir():
+            dep_pkg = pkg_index.name
+            if dep_pkg == pkg_name:
+                continue
+            content = pkg_index.read_text().strip()
+            if not content:
+                continue
+            idl_files = []
+            for line in content.splitlines():
+                line = line.strip()
+                if line.endswith('.idl'):
+                    # Find the actual IDL file
+                    idl_path = prefix / 'share' / dep_pkg / line
+                    if idl_path.is_file():
+                        idl_files.append(f'{dep_pkg}:{line}')
+            if idl_files:
+                deps[dep_pkg] = {
+                    'prefix': str(prefix),
+                    'idl_tuples': idl_files,
+                }
+
+    return deps
+
+
+def _discover_generators(ament_prefix_path):
+    """Discover available rosidl generators via ament extensions."""
+    generators = []
+    if not ament_prefix_path:
+        return generators
+
+    # Known generators in order of execution
+    known_generators = [
+        'rosidl_generator_type_description',
+        'rosidl_generator_c',
+        'rosidl_generator_cpp',
+        'rosidl_typesupport_fastrtps_c',
+        'rosidl_typesupport_fastrtps_cpp',
+        'rosidl_typesupport_introspection_c',
+        'rosidl_typesupport_introspection_cpp',
+        'rosidl_typesupport_c',
+        'rosidl_typesupport_cpp',
+    ]
+
+    for prefix in ament_prefix_path.split(':'):
+        if not prefix:
+            continue
+        prefix = Path(prefix)
+        for gen_name in known_generators:
+            gen_bin = prefix / 'lib' / gen_name / gen_name
+            if gen_bin.is_file() and gen_name not in [g['name'] for g in generators]:
+                template_dir = prefix / 'share' / gen_name / 'resource'
+                generators.append({
+                    'name': gen_name,
+                    'bin': str(gen_bin),
+                    'template_dir': str(template_dir) if template_dir.is_dir() else '',
+                    'prefix': str(prefix),
+                })
+
+    return generators
+
+
+def _collect_type_description_tuples(output_dir, pkg_name, idl_tuples):
+    """Collect type_description JSON files generated by rosidl_generator_type_description."""
+    td_output = Path(output_dir) / 'rosidl_generator_type_description' / pkg_name
+    tuples = []
+    for tuple_str in idl_tuples:
+        _, rel_path = tuple_str.split(':', 1)
+        # The type_description generator writes JSON files: msg/MyMsg.json (same stem as IDL)
+        stem = Path(rel_path).stem
+        kind = Path(rel_path).parts[0]  # msg, srv, action
+        json_file = td_output / kind / f'{stem}.json'
+        if json_file.is_file():
+            tuples.append(f'{rel_path}:{json_file}')
+        else:
+            logger.warning(f'Type description JSON not found: {json_file}')
+    return tuples
+
+
+def _to_snake_case(name):
+    """Convert CamelCase to snake_case."""
+    import re
+    s1 = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', name)
+    return re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1).lower()
+
+
+def _write_generator_args(
+    output_dir, pkg_name, idl_tuples, adapter_output_dir,
+    dep_idl_tuples, generator, include_paths, type_description_tuples=None
+):
+    """Write the JSON arguments file for a rosidl generator."""
+    args_dir = Path(output_dir) / 'rosidl_args'
+    args_dir.mkdir(parents=True, exist_ok=True)
+    gen_name = generator['name']
+    gen_output = Path(output_dir) / gen_name / pkg_name
+    gen_output.mkdir(parents=True, exist_ok=True)
+
+    # Build ros_interface_files list (absolute paths to IDL files)
+    ros_interface_files = []
+    for tuple_str in idl_tuples:
+        _, rel_path = tuple_str.split(':', 1)
+        abs_path = Path(adapter_output_dir) / rel_path
+        ros_interface_files.append(str(abs_path))
+
+    args = {
+        'package_name': pkg_name,
+        'output_dir': str(gen_output),
+        'template_dir': generator['template_dir'],
+        'idl_tuples': [
+            f'{adapter_output_dir}:{t.split(":", 1)[1]}'
+            for t in idl_tuples
+        ],
+        'ros_interface_files': ros_interface_files,
+        'ros_interface_dependencies': dep_idl_tuples,
+        'target_dependencies': [],
+        'type_description_tuples': type_description_tuples or [],
+        'include_paths': include_paths,
+    }
+
+    args_file = args_dir / f'{gen_name}_args.json'
+    args_file.write_text(json.dumps(args, indent=2))
+    return str(args_file), str(gen_output)
+
+
+def _run_generator(generator, args_file, env=None, extra_args=None):
+    """Execute a rosidl generator."""
+    cmd = [sys.executable, generator['bin'],
+           '--generator-arguments-file', args_file]
+    if extra_args:
+        cmd.extend(extra_args)
+    logger.info(f'Running {generator["name"]}: {" ".join(cmd)}')
+    result = subprocess.run(
+        cmd, env=env, capture_output=True, text=True)
+    if result.returncode != 0:
+        logger.error(
+            f'{generator["name"]} failed (rc={result.returncode}):\n'
+            f'stdout: {result.stdout}\nstderr: {result.stderr}')
+        return False
+    if result.stdout.strip():
+        logger.debug(f'{generator["name"]} stdout: {result.stdout}')
+    return True
+
+
+def _collect_generated_sources(output_dir, gen_name, pkg_name):
+    """Collect generated source files for compilation."""
+    gen_dir = Path(output_dir) / gen_name / pkg_name
+    sources = {'headers': [], 'sources': []}
+    if not gen_dir.is_dir():
+        return sources
+
+    for f in gen_dir.rglob('*'):
+        if f.is_file():
+            if f.suffix in ('.h', '.hpp'):
+                sources['headers'].append(str(f))
+            elif f.suffix in ('.c', '.cpp'):
+                sources['sources'].append(str(f))
+
+    return sources
+
+
+def _find_dep_rosidl_libs(ament_prefix_path, dep_packages):
+    """Find rosidl libraries for dependency packages."""
+    libs = []
+    for prefix in (ament_prefix_path or '').split(':'):
+        if not prefix:
+            continue
+        lib_dir = Path(prefix) / 'lib'
+        for dep_pkg in dep_packages:
+            for lib in sorted(lib_dir.glob(f'lib{dep_pkg}__*.so')):
+                libs.append(str(lib))
+    return libs
+
+
+def _generate_xmake_targets(output_dir, pkg_name, generators, ament_prefix_path,
+                             dep_packages=None):
+    """Generate xmake_rosidl_targets.lua for compiling generated code."""
+    lines = [
+        '-- Auto-generated by colcon-xmake rosidl pipeline',
+        '-- DO NOT EDIT',
+        '',
+    ]
+    # Find dependency rosidl libraries
+    dep_rosidl_libs = _find_dep_rosidl_libs(ament_prefix_path, dep_packages or [])
+
+    # Collect all generated files by generator
+    gen_sources = {}
+    for gen in generators:
+        sources = _collect_generated_sources(output_dir, gen['name'], pkg_name)
+        if sources['headers'] or sources['sources']:
+            gen_sources[gen['name']] = sources
+
+    if not gen_sources:
+        return None
+
+    # Add include paths for dependencies
+    include_dirs = set()
+    for prefix in (ament_prefix_path or '').split(':'):
+        if not prefix:
+            continue
+        inc = Path(prefix) / 'include'
+        if inc.is_dir():
+            include_dirs.add(str(inc))
+            # Add subdirectories (ROS2 nested include pattern)
+            for sub in inc.iterdir():
+                if sub.is_dir():
+                    include_dirs.add(str(sub))
+
+    # rosidl_generator_c library
+    c_gen = gen_sources.get('rosidl_generator_c', {})
+    c_sources = c_gen.get('sources', [])
+    c_headers = c_gen.get('headers', [])
+
+    # rosidl_generator_cpp (header-only)
+    cpp_gen = gen_sources.get('rosidl_generator_cpp', {})
+
+    # Typesupport sources
+    ts_generators = [
+        'rosidl_typesupport_fastrtps_c',
+        'rosidl_typesupport_fastrtps_cpp',
+        'rosidl_typesupport_introspection_c',
+        'rosidl_typesupport_introspection_cpp',
+        'rosidl_typesupport_c',
+        'rosidl_typesupport_cpp',
+    ]
+
+    # type_description sources
+    td_gen = gen_sources.get('rosidl_generator_type_description', {})
+    td_sources = td_gen.get('sources', [])
+
+    # Combine all C sources for the generator_c library
+    all_c_sources = c_sources + td_sources
+
+    if all_c_sources:
+        lines.append(f'target("{pkg_name}__rosidl_generator_c")')
+        lines.append('    set_kind("shared")')
+        lines.append(f'    set_basename("{pkg_name}__rosidl_generator_c")')
+        for src in all_c_sources:
+            lines.append(f'    add_files("{_lua_escape(src)}")')
+        # Include dirs for generated headers
+        for gen_name_key in ['rosidl_generator_c', 'rosidl_generator_type_description']:
+            gen_out = Path(output_dir) / gen_name_key
+            if gen_out.is_dir():
+                lines.append(f'    add_includedirs("{_lua_escape(str(gen_out))}", {{public = true}})')
+        for inc in sorted(include_dirs):
+            lines.append(f'    add_includedirs("{_lua_escape(inc)}")')
+        lines.append('    add_defines("rosidl_generator_c_EXPORTS")')
+        # Link against rosidl runtime and dep generator_c libs
+        gc_link_libs = ['rosidl_runtime_c', 'rosidl_typesupport_interface', 'rcutils']
+        for dep_pkg in (dep_packages or []):
+            gc_link_libs.append(f'{dep_pkg}__rosidl_generator_c')
+        gc_link_dirs = set()
+        gc_link_names = []
+        for lib_name_search in gc_link_libs:
+            for prefix in (ament_prefix_path or '').split(':'):
+                if not prefix:
+                    continue
+                lib_path = Path(prefix) / 'lib' / f'lib{lib_name_search}.so'
+                if lib_path.is_file():
+                    gc_link_dirs.add(str(lib_path.parent))
+                    if lib_name_search not in gc_link_names:
+                        gc_link_names.append(lib_name_search)
+                    break
+        for ld in sorted(gc_link_dirs):
+            lines.append(f'    add_linkdirs("{_lua_escape(ld)}")')
+            lines.append(f'    add_rpathdirs("{_lua_escape(ld)}")')
+        for ln in gc_link_names:
+            lines.append(f'    add_syslinks("{ln}")')
+        lines.append('')
+
+    # Typesupport libraries
+    for ts_name in ts_generators:
+        ts_gen = gen_sources.get(ts_name, {})
+        ts_sources = ts_gen.get('sources', [])
+        if not ts_sources:
+            continue
+
+        lib_name = f'{pkg_name}__{ts_name}'
+        lines.append(f'target("{lib_name}")')
+        lines.append('    set_kind("shared")')
+        lines.append(f'    set_basename("{lib_name}")')
+        for src in ts_sources:
+            lines.append(f'    add_files("{_lua_escape(src)}")')
+        # Include dirs
+        ts_out = Path(output_dir) / ts_name
+        if ts_out.is_dir():
+            lines.append(f'    add_includedirs("{_lua_escape(str(ts_out))}", {{public = true}})')
+        for gen_name_key in ['rosidl_generator_c', 'rosidl_generator_cpp',
+                              'rosidl_generator_type_description']:
+            gen_out = Path(output_dir) / gen_name_key
+            if gen_out.is_dir():
+                lines.append(f'    add_includedirs("{_lua_escape(str(gen_out))}")')
+        for inc in sorted(include_dirs):
+            lines.append(f'    add_includedirs("{_lua_escape(inc)}")')
+
+        # Link dependencies
+        if all_c_sources:
+            lines.append(f'    add_deps("{pkg_name}__rosidl_generator_c")')
+
+        # Link against runtime libs
+        _ts_runtime_libs = {
+            'rosidl_typesupport_fastrtps_c': [
+                'rosidl_runtime_c', 'rosidl_typesupport_interface',
+                'rosidl_typesupport_fastrtps_c', 'rcutils',
+                'rmw', 'rosidl_runtime_c',
+                'fastcdr', 'fastrtps',
+            ],
+            'rosidl_typesupport_fastrtps_cpp': [
+                'rosidl_runtime_c', 'rosidl_runtime_cpp',
+                'rosidl_typesupport_interface',
+                'rosidl_typesupport_fastrtps_cpp',
+                'rcutils', 'rmw',
+                'fastcdr', 'fastrtps',
+            ],
+            'rosidl_typesupport_introspection_c': [
+                'rosidl_runtime_c', 'rosidl_typesupport_interface',
+                'rosidl_typesupport_introspection_c', 'rcutils',
+            ],
+            'rosidl_typesupport_introspection_cpp': [
+                'rosidl_runtime_c', 'rosidl_runtime_cpp',
+                'rosidl_typesupport_interface',
+                'rosidl_typesupport_introspection_cpp', 'rcutils',
+            ],
+            'rosidl_typesupport_c': [
+                'rosidl_runtime_c', 'rosidl_typesupport_interface',
+                'rosidl_typesupport_c', 'rcutils',
+            ],
+            'rosidl_typesupport_cpp': [
+                'rosidl_runtime_c', 'rosidl_runtime_cpp',
+                'rosidl_typesupport_interface',
+                'rosidl_typesupport_cpp', 'rcutils',
+            ],
+        }
+        needed_libs = _ts_runtime_libs.get(ts_name, [])
+        # Add dep typesupport and generator_c libs
+        dep_libs = []
+        for dep_pkg in (dep_packages or []):
+            dep_libs.append(f'{dep_pkg}__{ts_name}')
+            dep_libs.append(f'{dep_pkg}__rosidl_generator_c')
+        all_link_libs = needed_libs + dep_libs
+        # Collect link dirs and lib names
+        link_dirs = set()
+        link_names = []
+        for lib_name_search in all_link_libs:
+            for prefix in (ament_prefix_path or '').split(':'):
+                if not prefix:
+                    continue
+                lib_path = Path(prefix) / 'lib' / f'lib{lib_name_search}.so'
+                if lib_path.is_file():
+                    link_dirs.add(str(lib_path.parent))
+                    if lib_name_search not in link_names:
+                        link_names.append(lib_name_search)
+                    break
+        for ld in sorted(link_dirs):
+            lines.append(f'    add_linkdirs("{_lua_escape(ld)}")')
+            lines.append(f'    add_rpathdirs("{_lua_escape(ld)}")')
+        lines.append('    add_ldflags("-Wl,--no-as-needed", {force = true})')
+        for ln in link_names:
+            lines.append(f'    add_syslinks("{ln}")')
+        lines.append('')
+
+    # Write the targets file
+    targets_file = Path(output_dir) / 'xmake_rosidl_targets.lua'
+    targets_file.write_text('\n'.join(lines) + '\n')
+
+    # Also write a shell script to set up link environment
+    # (xmake may strip flags; this ensures correct rpath at install time)
+    return str(targets_file)
+
+
+def _lua_escape(s):
+    """Escape a string for use in Lua."""
+    return s.replace('\\', '\\\\').replace('"', '\\"')
+
+
+def _generate_visibility_headers(output_dir, pkg_name, generators):
+    """Generate visibility control headers from .in templates for each generator."""
+    pkg_upper = pkg_name.upper()
+
+    # Map generator names to their visibility template file names and output locations
+    visibility_templates = {
+        'rosidl_generator_c': (
+            'rosidl_generator_c__visibility_control.h.in',
+            'rosidl_generator_c__visibility_control.h',
+        ),
+        'rosidl_generator_cpp': (
+            'rosidl_generator_cpp__visibility_control.hpp.in',
+            'rosidl_generator_cpp__visibility_control.hpp',
+        ),
+        'rosidl_typesupport_fastrtps_c': (
+            'rosidl_typesupport_fastrtps_c__visibility_control.h.in',
+            'rosidl_typesupport_fastrtps_c__visibility_control.h',
+        ),
+        'rosidl_typesupport_fastrtps_cpp': (
+            'rosidl_typesupport_fastrtps_cpp__visibility_control.h.in',
+            'rosidl_typesupport_fastrtps_cpp__visibility_control.h',
+        ),
+        'rosidl_typesupport_introspection_c': (
+            'rosidl_typesupport_introspection_c__visibility_control.h.in',
+            'rosidl_typesupport_introspection_c__visibility_control.h',
+        ),
+    }
+
+    for gen in generators:
+        gen_name = gen['name']
+        if gen_name not in visibility_templates:
+            continue
+
+        template_name, output_name = visibility_templates[gen_name]
+        template_path = Path(gen['prefix']) / 'share' / gen_name / 'resource' / template_name
+        if not template_path.is_file():
+            logger.warning(f'Visibility template not found: {template_path}')
+            continue
+
+        content = template_path.read_text()
+        content = content.replace('@PROJECT_NAME@', pkg_name)
+        content = content.replace('@PROJECT_NAME_UPPER@', pkg_upper)
+
+        # Write to the generator output directory under msg/
+        out_dir = Path(output_dir) / gen_name / pkg_name / 'msg'
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / output_name).write_text(content)
+
+
+def generate_rosidl(
+    source_dir, build_base, install_base, pkg_name, ament_prefix_path, env=None
+):
+    """Main entry point: run the full rosidl code generation pipeline.
+
+    Returns the path to the generated xmake targets file, or None if
+    no interfaces were found.
+    """
+    if not has_interfaces(source_dir):
+        return None
+
+    output_dir = str(Path(build_base) / 'rosidl_output')
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    # Step 1: Convert .msg/.srv/.action to .idl
+    logger.info(f'Running rosidl adapter for {pkg_name}')
+    idl_tuples, adapter_output_dir = _run_adapter(source_dir, pkg_name, output_dir)
+    if not idl_tuples:
+        logger.warning(f'No IDL files generated for {pkg_name}')
+        return None
+
+    # Step 2: Resolve dependencies
+    deps = _resolve_dependencies(pkg_name, ament_prefix_path)
+    dep_idl_tuples = []
+    include_paths = []
+    for dep_pkg, dep_info in deps.items():
+        dep_idl_tuples.extend(dep_info['idl_tuples'])
+        # include_paths format: "package_name:/path/to/share/package_name"
+        include_paths.append(
+            f'{dep_pkg}:{Path(dep_info["prefix"]) / "share" / dep_pkg}')
+
+    # Also add all packages in AMENT_PREFIX_PATH that have rosidl_interfaces
+    # (needed for transitive dependencies like service_msgs, action_msgs)
+    for prefix in (ament_prefix_path or '').split(':'):
+        if not prefix:
+            continue
+        prefix_p = Path(prefix)
+        index_dir = prefix_p / 'share' / 'ament_index' / 'resource_index' / 'rosidl_interfaces'
+        if not index_dir.is_dir():
+            continue
+        for pkg_index in index_dir.iterdir():
+            dep_name = pkg_index.name
+            entry = f'{dep_name}:{prefix_p / "share" / dep_name}'
+            if entry not in include_paths:
+                include_paths.append(entry)
+
+    # Step 3: Discover generators
+    generators = _discover_generators(ament_prefix_path)
+    if not generators:
+        logger.error('No rosidl generators found in AMENT_PREFIX_PATH')
+        return None
+
+    # Step 4: Run each generator
+    gen_env = dict(env or os.environ)
+    # Ensure AMENT_PREFIX_PATH is set for generators
+    gen_env['AMENT_PREFIX_PATH'] = ament_prefix_path or ''
+    # Add Python path for rosidl modules
+    python_path = gen_env.get('PYTHONPATH', '')
+    gen_env['PYTHONPATH'] = python_path
+
+    type_description_tuples = []
+    for generator in generators:
+        # After type_description runs, collect its output for subsequent generators
+        if generator['name'] != 'rosidl_generator_type_description' and not type_description_tuples:
+            type_description_tuples = _collect_type_description_tuples(
+                output_dir, pkg_name, idl_tuples)
+
+        td_arg = type_description_tuples if generator['name'] != 'rosidl_generator_type_description' else []
+        args_file, gen_output = _write_generator_args(
+            output_dir, pkg_name, idl_tuples, adapter_output_dir,
+            dep_idl_tuples, generator, include_paths,
+            type_description_tuples=td_arg,
+        )
+        # rosidl_typesupport_c/cpp need --typesupports arg
+        extra_args = None
+        gen_name = generator['name']
+        if gen_name == 'rosidl_typesupport_c':
+            # List available C typesupport implementations
+            ts_impls = []
+            for g in generators:
+                if g['name'] in ('rosidl_typesupport_fastrtps_c',
+                                  'rosidl_typesupport_introspection_c'):
+                    ts_impls.append(g['name'])
+            if ts_impls:
+                extra_args = ['--typesupports'] + ts_impls
+        elif gen_name == 'rosidl_typesupport_cpp':
+            ts_impls = []
+            for g in generators:
+                if g['name'] in ('rosidl_typesupport_fastrtps_cpp',
+                                  'rosidl_typesupport_introspection_cpp'):
+                    ts_impls.append(g['name'])
+            if ts_impls:
+                extra_args = ['--typesupports'] + ts_impls
+
+        if not _run_generator(generator, args_file, env=gen_env,
+                              extra_args=extra_args):
+            logger.error(f'Generator {generator["name"]} failed')
+            return None
+
+    # Step 5: Generate visibility control headers from .in templates
+    _generate_visibility_headers(output_dir, pkg_name, generators)
+
+    # Step 6: Generate xmake targets for compiling generated code
+    dep_packages = list(deps.keys())
+    # Also add common dependency packages that are needed for services/actions
+    for common_dep in ['service_msgs', 'action_msgs', 'builtin_interfaces',
+                       'unique_identifier_msgs']:
+        if common_dep not in dep_packages:
+            dep_packages.append(common_dep)
+    targets_file = _generate_xmake_targets(
+        output_dir, pkg_name, generators, ament_prefix_path,
+        dep_packages=dep_packages)
+
+    return targets_file
+
+
+def install_rosidl_artifacts(
+    source_dir, build_base, install_base, pkg_name
+):
+    """Install rosidl-generated artifacts to the install directory.
+
+    This includes:
+    - Generated headers to include/<pkg>/
+    - IDL files to share/<pkg>/msg|srv|action/
+    - Register in ament index as rosidl_interfaces
+    """
+    output_dir = Path(build_base) / 'rosidl_output'
+    install = Path(install_base)
+
+    if not output_dir.is_dir():
+        return
+
+    # Install generated C++ headers
+    for gen_name in ['rosidl_generator_cpp', 'rosidl_generator_c',
+                     'rosidl_generator_type_description']:
+        gen_out = output_dir / gen_name / pkg_name
+        if gen_out.is_dir():
+            dst = install / 'include' / pkg_name / pkg_name
+            dst.mkdir(parents=True, exist_ok=True)
+            _copy_tree(gen_out, dst)
+
+    # Install IDL files to share/<pkg>/
+    interface_files = find_interface_files(source_dir)
+    idl_dir = output_dir / 'rosidl_adapter' / pkg_name
+    index_lines = []
+    for kind, files in interface_files.items():
+        if not files:
+            continue
+        # Install original .msg/.srv files
+        share_kind = install / 'share' / pkg_name / kind
+        share_kind.mkdir(parents=True, exist_ok=True)
+        for f in files:
+            _copy_file(f, share_kind / f.name)
+            index_lines.append(f'{kind}/{f.name}')
+        # Install .idl files
+        idl_kind_dir = idl_dir / kind
+        if idl_kind_dir.is_dir():
+            for idl_file in idl_kind_dir.iterdir():
+                if idl_file.suffix == '.idl':
+                    _copy_file(idl_file, share_kind / idl_file.name)
+                    index_lines.append(f'{kind}/{idl_file.name}')
+
+    # Register in ament resource index
+    if index_lines:
+        index_dir = install / 'share' / 'ament_index' / 'resource_index' / 'rosidl_interfaces'
+        index_dir.mkdir(parents=True, exist_ok=True)
+        (index_dir / pkg_name).write_text('\n'.join(index_lines) + '\n')
+
+    # Generate CMake export extras so downstream packages can find our libraries
+    _generate_cmake_exports(install_base, pkg_name)
+
+
+def _generate_cmake_exports(install_base, pkg_name):
+    """Generate CMake export files for rosidl package discovery."""
+    install = Path(install_base)
+    cmake_dir = install / 'share' / pkg_name / 'cmake'
+    cmake_dir.mkdir(parents=True, exist_ok=True)
+    lib_dir = install / 'lib'
+    include_dir = install / 'include' / pkg_name
+
+    # Find all rosidl libraries
+    rosidl_libs = []
+    for lib in sorted(lib_dir.glob(f'lib{pkg_name}__*.so')):
+        rosidl_libs.append(lib.name)
+
+    # Generate ament_cmake_export_libraries-extras.cmake
+    lib_names = [lib.replace('.so', '').replace('lib', '', 1) for lib in rosidl_libs]
+    lib_export = cmake_dir / 'ament_cmake_export_libraries-extras.cmake'
+    lib_lines = [
+        '# generated by colcon-xmake rosidl pipeline',
+        f'set(_exported_libraries "{";".join(lib_names)}")',
+    ]
+    lib_export.write_text('\n'.join(lib_lines) + '\n')
+
+    # Generate ament_cmake_export_include_directories-extras.cmake
+    inc_export = cmake_dir / 'ament_cmake_export_include_directories-extras.cmake'
+    inc_lines = [
+        '# generated by colcon-xmake rosidl pipeline',
+        f'set(_exported_include_dirs "{include_dir}")',
+    ]
+    inc_export.write_text('\n'.join(inc_lines) + '\n')
+
+    # Generate ament_cmake_export_dependencies-extras.cmake
+    dep_export = cmake_dir / 'ament_cmake_export_dependencies-extras.cmake'
+    dep_lines = [
+        '# generated by colcon-xmake rosidl pipeline',
+        'set(_exported_dependencies "rosidl_runtime_c;rosidl_runtime_cpp;'
+        'rosidl_typesupport_interface")',
+    ]
+    dep_export.write_text('\n'.join(dep_lines) + '\n')
+
+
+def _copy_tree(src, dst):
+    """Recursively copy a directory tree."""
+    import shutil
+    for item in src.iterdir():
+        s = item
+        d = dst / item.name
+        if item.is_dir():
+            d.mkdir(parents=True, exist_ok=True)
+            _copy_tree(s, d)
+        else:
+            shutil.copy2(str(s), str(d))
+
+
+def _copy_file(src, dst):
+    """Copy a single file."""
+    import shutil
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(str(src), str(dst))

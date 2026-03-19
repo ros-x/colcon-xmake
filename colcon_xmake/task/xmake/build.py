@@ -194,13 +194,16 @@ def _generate_ros_index_file(build_base, ament_prefix_path):
     return str(index_path)
 
 
-def _write_entry_file(build_base, project_path, rule_file, index_file=None):
+def _write_entry_file(build_base, project_path, rule_file, index_file=None,
+                      rosidl_targets_file=None):
     path = Path(build_base) / 'colcon_xmake_entry.lua'
     lines = []
     if index_file:
         lines.append(f'includes("{_lua_quote(index_file)}")')
     if rule_file:
         lines.append(f'includes("{_lua_quote(rule_file)}")')
+    if rosidl_targets_file:
+        lines.append(f'includes("{_lua_quote(rosidl_targets_file)}")')
     lines.append(f'includes("{_lua_quote(str(Path(project_path) / "xmake.lua"))}")')
     path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
     return str(path)
@@ -266,8 +269,39 @@ class XmakeBuildTask(TaskExtensionPoint):
             return 1
         index_file = _generate_ros_index_file(
             args.build_base, env.get('AMENT_PREFIX_PATH'))
+
+        # Run rosidl code generation if this package has interface files
+        rosidl_targets_file = None
+        try:
+            from colcon_xmake.task.rosidl import generate_rosidl
+            from colcon_xmake.task.rosidl import has_interfaces
+            from colcon_xmake.task.rosidl import install_rosidl_artifacts
+            if has_interfaces(str(args.path)):
+                pkg_name = getattr(self.context.pkg, 'name', None) or \
+                    Path(args.path).name
+                rosidl_targets_file = generate_rosidl(
+                    source_dir=str(args.path),
+                    build_base=args.build_base,
+                    install_base=args.install_base,
+                    pkg_name=pkg_name,
+                    ament_prefix_path=env.get('AMENT_PREFIX_PATH', ''),
+                    env=env,
+                )
+                if rosidl_targets_file:
+                    logger.info(
+                        f'rosidl targets generated: {rosidl_targets_file}')
+                # Store for post-install
+                self._rosidl_pkg_name = pkg_name
+                self._has_rosidl = True
+        except ImportError:
+            logger.debug('rosidl module not available, skipping')
+        except Exception as e:
+            logger.error(f'rosidl code generation failed: {e}')
+            return 1
+
         entry_file = _write_entry_file(
-            args.build_base, str(args.path), rule_file, index_file=index_file)
+            args.build_base, str(args.path), rule_file, index_file=index_file,
+            rosidl_targets_file=rosidl_targets_file)
 
         ensure_build_layout(args)
 
@@ -306,6 +340,24 @@ class XmakeBuildTask(TaskExtensionPoint):
             '-o', args.install_base,
             '--file=' + entry_file,
         ] + (args.xmake_install_args or [])
-        return await run_command(
+        rc = await run_command(
             self.context, install_cmd, cwd=str(args.path), env=env,
             timeout=args.xmake_timeout)
+        if rc:
+            return rc
+
+        # Install rosidl artifacts if applicable
+        if getattr(self, '_has_rosidl', False):
+            try:
+                from colcon_xmake.task.rosidl import install_rosidl_artifacts
+                install_rosidl_artifacts(
+                    source_dir=str(args.path),
+                    build_base=args.build_base,
+                    install_base=args.install_base,
+                    pkg_name=self._rosidl_pkg_name,
+                )
+            except Exception as e:
+                logger.error(f'Failed to install rosidl artifacts: {e}')
+                return 1
+
+        return 0

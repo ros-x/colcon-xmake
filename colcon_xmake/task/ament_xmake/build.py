@@ -1,3 +1,5 @@
+import subprocess
+import sys
 from pathlib import Path
 
 from colcon_core.environment import create_environment_scripts
@@ -71,6 +73,22 @@ class AmentXmakeBuildTask(TaskExtensionPoint):
             install(
                 args, 'package.xml',
                 f'share/{self.context.pkg.name}/package.xml')
+
+        # Install Python modules if setup.py exists (mixed C++/Python packages)
+        setup_py = Path(args.path) / 'setup.py'
+        if setup_py.is_file():
+            logger.info(f'Installing Python modules from {setup_py}')
+            python_lib = install_base / 'lib' / 'python3' / 'dist-packages'
+            python_lib.mkdir(parents=True, exist_ok=True)
+            result = subprocess.run(
+                [sys.executable, 'setup.py', 'install',
+                 '--install-lib', str(python_lib),
+                 '--install-scripts', str(install_base / 'lib' / self.context.pkg.name)],
+                cwd=str(args.path),
+                capture_output=True, text=True)
+            if result.returncode != 0:
+                logger.error(f'Python setup.py install failed: {result.stderr}')
+                return 1
 
         additional_hooks = create_environment_hook(
             'ament_prefix_path', Path(args.install_base),
