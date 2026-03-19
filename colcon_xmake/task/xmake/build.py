@@ -9,6 +9,7 @@ from colcon_xmake.task import ensure_build_layout
 from colcon_xmake.task import normalize_timeout
 from colcon_xmake.task import run_command
 from colcon_xmake.task.xmake import XMAKE_EXECUTABLE
+from colcon_xmake.task.xmake import resolve_ament_xmake_rule_file
 
 logger = colcon_logger.getChild(__name__)
 
@@ -61,6 +62,9 @@ class XmakeBuildTask(TaskExtensionPoint):
             return 1
         if getattr(args, 'symlink_install', False):
             env['AMENT_XMAKE_SYMLINK_INSTALL'] = '1'
+        rule_file = resolve_ament_xmake_rule_file(env.get('AMENT_PREFIX_PATH'))
+        if rule_file:
+            env['AMENT_XMAKE_RULE_FILE'] = rule_file
 
         ensure_build_layout(args)
 
