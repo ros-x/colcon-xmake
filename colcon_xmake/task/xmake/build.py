@@ -1,5 +1,6 @@
 import shutil
 import re
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from colcon_core.logging import colcon_logger
@@ -20,18 +21,52 @@ def _lua_quote(text):
     return text.replace('\\', '\\\\').replace('"', '\\"')
 
 
-def _parse_set_value(path, variable):
-    if not path.is_file():
-        return []
-    text = path.read_text(encoding='utf-8', errors='ignore')
-    pattern = rf'set\(\s*{re.escape(variable)}\s+"([^"]*)"'
-    match = re.search(pattern, text)
-    if not match:
-        return []
-    value = match.group(1).strip()
+def _split_cmake_list(raw):
+    value = raw.strip()
     if not value:
         return []
-    return [part for part in value.split(';') if part]
+    if value.startswith('"') and value.endswith('"'):
+        value = value[1:-1]
+    if ';' in value:
+        return [part for part in value.split(';') if part]
+    return [part for part in value.split() if part]
+
+
+def _resolve_cmake_value(raw_value, set_values):
+    value = raw_value.strip()
+    if not value:
+        return []
+
+    unquoted = value
+    if value.startswith('"') and value.endswith('"'):
+        unquoted = value[1:-1].strip()
+
+    if unquoted.startswith('${') and unquoted.endswith('}'):
+        ref_name = unquoted[2:-1]
+        return list(set_values.get(ref_name, []))
+    return _split_cmake_list(value)
+
+
+def _parse_cmake_set_map(path):
+    if not path.is_file():
+        return {}
+    text = path.read_text(encoding='utf-8', errors='ignore')
+    set_values = {}
+    pattern = re.compile(
+        r'set\(\s*([A-Za-z0-9_]+)\s+(.+?)\s*\)',
+        re.MULTILINE | re.DOTALL)
+    for match in pattern.finditer(text):
+        variable = match.group(1).strip()
+        raw_value = match.group(2).strip()
+        set_values[variable] = _resolve_cmake_value(raw_value, set_values)
+    return set_values
+
+
+def _parse_set_value(path, variable):
+    set_values = _parse_cmake_set_map(path)
+    if variable not in set_values:
+        return []
+    return list(set_values[variable])
 
 
 def _replace_pkg_dir(parts, pkg, cmake_dir):
@@ -54,7 +89,32 @@ def _append_unique(dst, values):
             dst.append(value)
 
 
+def _parse_package_xml_dependencies(path):
+    if not path.is_file():
+        return []
+    try:
+        root = ET.fromstring(path.read_text(encoding='utf-8', errors='ignore'))
+    except ET.ParseError:
+        return []
+
+    deps = []
+    dep_tags = (
+        'depend',
+        'build_depend',
+        'build_export_depend',
+        'exec_depend',
+    )
+    for tag in dep_tags:
+        for node in root.findall(tag):
+            if node.text:
+                value = node.text.strip()
+                if value and value not in deps:
+                    deps.append(value)
+    return deps
+
+
 def _generate_ros_index_file(build_base, ament_prefix_path):
+    Path(build_base).mkdir(parents=True, exist_ok=True)
     prefixes = [Path(p) for p in (ament_prefix_path or '').split(':') if p]
     index = {}
     for prefix in prefixes:
@@ -66,20 +126,31 @@ def _generate_ros_index_file(build_base, ament_prefix_path):
                 continue
             pkg = pkg_dir.name
             cmake_dir = pkg_dir / 'cmake'
-            if not cmake_dir.is_dir():
-                continue
-
             dep_file = cmake_dir / 'ament_cmake_export_dependencies-extras.cmake'
             inc_file = cmake_dir / 'ament_cmake_export_include_directories-extras.cmake'
             lib_file = cmake_dir / 'ament_cmake_export_libraries-extras.cmake'
-            if not (dep_file.is_file() or inc_file.is_file() or lib_file.is_file()):
+            def_file = cmake_dir / 'ament_cmake_export_definitions-extras.cmake'
+            pkg_xml = pkg_dir / 'package.xml'
+            has_extras = dep_file.is_file() or inc_file.is_file() or lib_file.is_file() or def_file.is_file()
+            has_pkg_xml = pkg_xml.is_file()
+            if not has_extras and not has_pkg_xml:
                 continue
 
-            include_dirs = _replace_pkg_dir(
-                _parse_set_value(inc_file, '_exported_include_dirs'),
-                pkg, cmake_dir)
-            dependencies = _parse_set_value(dep_file, '_exported_dependencies')
+            include_dirs = []
+            if inc_file.is_file():
+                include_dirs = _replace_pkg_dir(
+                    _parse_set_value(inc_file, '_exported_include_dirs'),
+                    pkg, cmake_dir)
+            compile_definitions = []
+            if def_file.is_file():
+                compile_definitions = _parse_set_value(def_file, '_exported_definitions')
+            dependencies = []
+            _append_unique(dependencies, _parse_set_value(dep_file, '_exported_dependencies'))
+            _append_unique(dependencies, _parse_package_xml_dependencies(pkg_xml))
             exported_libraries = _parse_set_value(lib_file, '_exported_libraries')
+            pkg_include_dir = prefix / 'include' / pkg
+            if pkg_include_dir.is_dir():
+                _append_unique(include_dirs, [str(pkg_include_dir)])
 
             link_flags = []
             rpath_dirs = []
@@ -101,7 +172,7 @@ def _generate_ros_index_file(build_base, ament_prefix_path):
 
             index[pkg] = {
                 'include_dirs': include_dirs,
-                'compile_definitions': [],
+                'compile_definitions': compile_definitions,
                 'link_flags': link_flags,
                 'rpath_dirs': rpath_dirs,
                 'dependencies': dependencies,
