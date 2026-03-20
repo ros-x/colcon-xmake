@@ -170,6 +170,26 @@ def _generate_ros_index_file(build_base, ament_prefix_path):
                     _append_unique(link_flags, [f'-L{prefix / "lib"}', f'-l{item}'])
                     _append_unique(rpath_dirs, [str(prefix / 'lib')])
 
+            # Fallback: parse export_targets for IMPORTED_LOCATION
+            if not link_flags:
+                targets_file = cmake_dir / 'ament_cmake_export_targets-extras.cmake'
+                if targets_file.is_file():
+                    exported_targets = _parse_set_value(targets_file, '_exported_targets')
+                    for target_name in exported_targets:
+                        for suffix in ('-none', '-release', '-relwithdebinfo', ''):
+                            export_file = cmake_dir / f'{target_name}Export{suffix}.cmake'
+                            if export_file.is_file():
+                                text = export_file.read_text(encoding='utf-8', errors='ignore')
+                                loc_match = re.search(
+                                    r'IMPORTED_LOCATION[_A-Z]*\s+"([^"]+)"', text)
+                                if loc_match:
+                                    loc = loc_match.group(1)
+                                    loc = loc.replace('${_IMPORT_PREFIX}', str(prefix))
+                                    if Path(loc).is_file():
+                                        _append_unique(link_flags, [loc])
+                                        _append_unique(rpath_dirs, [str(Path(loc).parent)])
+                                break
+
             index[pkg] = {
                 'include_dirs': include_dirs,
                 'compile_definitions': compile_definitions,
