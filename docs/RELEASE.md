@@ -1,3 +1,8 @@
+---
+sidebar_position: 3
+title: Release
+---
+
 # colcon-xmake Release Notes Process
 
 1. Update version in:

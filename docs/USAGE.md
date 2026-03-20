@@ -1,3 +1,8 @@
+---
+sidebar_position: 1
+title: Usage
+---
+
 # colcon-xmake Usage
 
 ## Install
