@@ -1,3 +1,8 @@
+---
+sidebar_position: 2
+title: Testing
+---
+
 # colcon-xmake Testing
 
 ## Unit tests
